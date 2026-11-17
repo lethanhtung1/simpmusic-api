@@ -39,33 +39,22 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// 2. Endpoint Stream Proxy (Server tải hộ và truyền dữ liệu sạch về cho trình duyệt)
+// 2. Endpoint Stream dùng yt.download chính hãng
 app.get('/api/stream/:id', async (req, res) => {
   try {
     const { id } = req.params;
     if (!yt) yt = await Innertube.create();
 
-    const info = await yt.getBasicInfo(id);
-    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+    res.setHeader('Content-Type', 'audio/webm');
     
-    if (!format || !format.url) {
-      return res.status(404).json({ error: 'Không tìm thấy nguồn phát' });
-    }
+    // Tải và truyền luồng âm thanh tối ưu bằng youtubei.js
+    const stream = await yt.download(id, {
+      type: 'audio',
+      quality: 'best',
+      format: 'any'
+    });
 
-    const streamUrl = format.decipher(yt.session.player);
-
-    // Dùng fetch để tải luồng âm thanh gốc từ YouTube
-    const audioRes = await fetch(streamUrl);
-    if (!audioRes.ok) throw new Error('Không thể tải luồng âm thanh từ YouTube');
-
-    // Thiết lập header báo cho trình duyệt biết đây là tệp âm thanh
-    res.setHeader('Content-Type', audioRes.headers.get('content-type') || 'audio/webm');
-    
-    const contentLength = audioRes.headers.get('content-type');
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-
-    // Truyền dữ liệu dạng chunks từ fetch sang response của Express
-    const reader = audioRes.body.getReader();
+    const reader = stream.getReader();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
