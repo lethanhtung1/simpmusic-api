@@ -3,24 +3,28 @@ import cors from 'cors';
 import { Innertube } from 'youtubei.js';
 
 const app = express();
-app.use(cors()); // Cho phép Vercel gọi sang
+app.use(cors());
 
 let yt;
 (async () => {
-  yt = await Innertube.create();
-  console.log('✅ InnerTube đã sẵn sàng!');
+  try {
+    yt = await Innertube.create();
+    console.log('✅ InnerTube đã sẵn sàng!');
+  } catch (err) {
+    console.error('Lỗi khởi tạo InnerTube:', err);
+  }
 })();
 
 // 1. Endpoint tìm kiếm bài hát
-// 1. Endpoint tìm kiếm bài hát (đã cập nhật cú pháp chuẩn của youtubei.js)
 app.get('/api/search', async (req, res) => {
   try {
     const q = req.query.q;
     if (!q) return res.json([]);
 
-    const search = await yt.search(q, { type: 'video' }); // Dùng yt.search thay vì yt.music.search để ổn định hơn
+    if (!yt) yt = await Innertube.create();
+    const search = await yt.search(q, { type: 'video' });
     const songs = search.results
-      .filter(item => item.type === 'Video') // Lọc lấy các kết quả là video/audio
+      .filter(item => item.type === 'Video')
       .map((item) => ({
         id: item.id,
         title: item.title?.text || item.title,
@@ -35,31 +39,27 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// 2. Endpoint phát nhạc trực tiếp (Server tải từ YouTube và truyền thẳng về web)
+// 2. Endpoint phát nhạc (Sử dụng cơ chế truyền trực tiếp URL stream đã giải mã)
 app.get('/api/stream/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    res.setHeader('Content-Type', 'audio/webm'); // Định dạng âm thanh mặc định của YouTube
-    
-    const stream = await yt.download(id, {
-      type: 'audio',
-      quality: 'best',
-      format: 'any'
-    });
+    if (!yt) yt = await Innertube.create();
 
-    // Chuyển đổi Web ReadableStream sang Node Stream để gửi về thẻ <audio>
-    const reader = stream.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(value);
+    const info = await yt.getBasicInfo(id);
+    
+    // Lấy link stream âm thanh chất lượng tốt nhất
+    const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+    if (!format || !format.url) {
+      return res.status(404).json({ error: 'Không tìm thấy nguồn phát' });
     }
-    res.end();
+
+    const streamUrl = format.decipher(yt.session.player);
+    
+    // Redirect thẳng trình duyệt đến link stream gốc của YouTube (giúp giảm tải cho server Render và chạy mượt 100%)
+    res.redirect(streamUrl);
   } catch (err) {
-    console.error(err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Không thể phát bài này' });
-    }
+    console.error("Lỗi phát nhạc:", err);
+    res.status(500).json({ error: 'Không thể phát bài này' });
   }
 });
 
