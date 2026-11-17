@@ -12,21 +12,25 @@ let yt;
 })();
 
 // 1. Endpoint tìm kiếm bài hát
+// 1. Endpoint tìm kiếm bài hát (đã cập nhật cú pháp chuẩn của youtubei.js)
 app.get('/api/search', async (req, res) => {
   try {
     const q = req.query.q;
     if (!q) return res.json([]);
 
-    const search = await yt.music.search(q, { type: 'song' });
-    const songs = search.results.map((item) => ({
-      id: item.id,
-      title: item.title,
-      artist: item.artists?.map((a) => a.name).join(', ') || 'Unknown',
-      thumbnail: item.thumbnails?.[0]?.url || '',
-    }));
+    const search = await yt.search(q, { type: 'video' }); // Dùng yt.search thay vì yt.music.search để ổn định hơn
+    const songs = search.results
+      .filter(item => item.type === 'Video') // Lọc lấy các kết quả là video/audio
+      .map((item) => ({
+        id: item.id,
+        title: item.title?.text || item.title,
+        artist: item.author?.name || 'Unknown',
+        thumbnail: item.thumbnails?.[0]?.url || '',
+      }));
 
     res.json(songs);
   } catch (err) {
+    console.error("Lỗi tìm kiếm:", err);
     res.status(500).json({ error: err.message });
   }
 });
