@@ -51,7 +51,7 @@ async function resolveAudio(id) {
   if (hit && hit.exp > Date.now()) return hit;
 
   const yt = await getYT();
-  let lastErr;
+  const errs = [];
   for (const client of CLIENTS) {
     try {
       const info = await yt.getBasicInfo(id, { client });
@@ -73,11 +73,11 @@ async function resolveAudio(id) {
       console.log(`✔ ${id} lấy được bằng client ${client}`);
       return entry;
     } catch (e) {
-      lastErr = e;
+      errs.push(`${client}: ${e.message}`);
       console.warn(`✘ ${id} client ${client}: ${e.message}`);
     }
   }
-  throw lastErr || new Error('Không lấy được audio');
+  throw new Error(errs.join(' | ') || 'Không lấy được audio');
 }
 
 // 3. Proxy stream (hỗ trợ Range để tua bài)
