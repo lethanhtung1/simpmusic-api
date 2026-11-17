@@ -39,27 +39,45 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// 2. Endpoint phát nhạc (Sử dụng cơ chế truyền trực tiếp URL stream đã giải mã)
+// 2. Endpoint Stream Proxy (Server tải hộ và truyền dữ liệu sạch về cho trình duyệt)
 app.get('/api/stream/:id', async (req, res) => {
   try {
     const { id } = req.params;
     if (!yt) yt = await Innertube.create();
 
     const info = await yt.getBasicInfo(id);
-    
-    // Lấy link stream âm thanh chất lượng tốt nhất
     const format = info.chooseFormat({ type: 'audio', quality: 'best' });
+    
     if (!format || !format.url) {
       return res.status(404).json({ error: 'Không tìm thấy nguồn phát' });
     }
 
     const streamUrl = format.decipher(yt.session.player);
+
+    // Dùng fetch để tải luồng âm thanh gốc từ YouTube
+    const audioRes = await fetch(streamUrl);
+    if (!audioRes.ok) throw new Error('Không thể tải luồng âm thanh từ YouTube');
+
+    // Thiết lập header báo cho trình duyệt biết đây là tệp âm thanh
+    res.setHeader('Content-Type', audioRes.headers.get('content-type') || 'audio/webm');
     
-    // Redirect thẳng trình duyệt đến link stream gốc của YouTube (giúp giảm tải cho server Render và chạy mượt 100%)
-    res.redirect(streamUrl);
+    const contentLength = audioRes.headers.get('content-type');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    // Truyền dữ liệu dạng chunks từ fetch sang response của Express
+    const reader = audioRes.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+    res.end();
+
   } catch (err) {
     console.error("Lỗi phát nhạc:", err);
-    res.status(500).json({ error: 'Không thể phát bài này' });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Không thể phát bài này' });
+    }
   }
 });
 
