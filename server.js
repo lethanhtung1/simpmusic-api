@@ -58,7 +58,7 @@ app.get('/api/search', async (req, res) => {
         thumbnail: item.thumbnails?.[0]?.url || '',
       }));
     res.json(songs);
-    if (process.env.PREFETCH !== '0') {
+    if (process.env.PREFETCH === '1') {
       for (const sg of songs.slice(0, 3)) resolveAudio(sg.id).catch(() => {});
     }
   } catch (err) {
@@ -73,7 +73,7 @@ const inflight = new Map(); // id -> Promise (gộp các request cùng bài)
 const MIME = { m4a: 'audio/mp4', mp4: 'audio/mp4', webm: 'audio/webm', opus: 'audio/ogg', mp3: 'audio/mpeg' };
 
 // Giới hạn số yt-dlp chạy cùng lúc
-const MAX_PARALLEL = 3;
+const MAX_PARALLEL = Number(process.env.MAX_PARALLEL) || 2;
 let active = 0;
 const waiting = [];
 function limit(fn) {
@@ -102,7 +102,7 @@ async function runYtdlp(id, attempt = 0) {
       ...(process.env.YTDLP_EXTRA ? process.env.YTDLP_EXTRA.split(' ').filter(Boolean) : []),
       `https://www.youtube.com/watch?v=${id}`,
     ],
-    { maxBuffer: 20 * 1024 * 1024, timeout: 40000 }
+    { maxBuffer: 20 * 1024 * 1024, timeout: Number(process.env.YTDLP_TIMEOUT_MS) || 90000 }
   );
   const j = JSON.parse(stdout);
   if (!j.url) throw new Error('yt-dlp không trả về URL');
@@ -168,6 +168,8 @@ app.get('/api/stream/:id', async (req, res) => {
 
   const ac = new AbortController();
   res.on('close', () => ac.abort());
+  const t0 = Date.now();
+  console.log(`▶ ${id} yêu cầu stream${req.headers.range ? ' (' + req.headers.range + ')' : ''}`);
 
   try {
     const doFetch = (a) =>
@@ -177,6 +179,7 @@ app.get('/api/stream/:id', async (req, res) => {
       });
 
     let audio = await resolveAudio(id);
+    console.log(`⏱ ${id} có link sau ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     let upstream = await doFetch(audio);
 
     if (upstream.status === 403 || upstream.status === 410) {
@@ -184,6 +187,7 @@ app.get('/api/stream/:id', async (req, res) => {
       audio = await resolveAudio(id);
       upstream = await doFetch(audio);
     }
+    console.log(`⇢ ${id} googlevideo trả ${upstream.status}`);
     if (!upstream.ok && upstream.status !== 206) {
       throw new Error(`YouTube trả về ${upstream.status}`);
     }
@@ -197,7 +201,7 @@ app.get('/api/stream/:id', async (req, res) => {
     }
     Readable.fromWeb(upstream.body).on('error', () => res.end()).pipe(res);
   } catch (err) {
-    if (err.name === 'AbortError') return;
+    if (err.name === 'AbortError') { console.log(`⏹ ${id} trình duyệt đã hủy/đóng kết nối sau ${((Date.now() - t0) / 1000).toFixed(1)}s`); return; }
     console.error('Lỗi phát nhạc:', err.message);
     if (!res.headersSent) res.status(500).json({ error: 'Không thể phát bài này', detail: err.message });
     else res.end();
