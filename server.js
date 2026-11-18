@@ -1,16 +1,39 @@
 import express from 'express';
 import cors from 'cors';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { Readable } from 'node:stream';
 import { Innertube, UniversalCache } from 'youtubei.js';
+
+const execFileP = promisify(execFile);
+const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
+const JS_RUNTIME = process.env.JS_RUNTIME; // vd: node (trong Docker), để trống nếu máy có deno
+
+// Cookies (Render: thêm Secret File tên cookies.txt -> /etc/secrets/cookies.txt)
+const COOKIE_SRC = process.env.COOKIES_FILE || '/etc/secrets/cookies.txt';
+let cookiePath = null;
+try {
+  if (fs.existsSync(COOKIE_SRC)) {
+    cookiePath = path.join(os.tmpdir(), 'yt-cookies.txt');
+    fs.copyFileSync(COOKIE_SRC, cookiePath); // copy vì yt-dlp có thể ghi lại file
+    console.log('🍪 Đang dùng cookies YouTube');
+  }
+} catch (e) {
+  console.warn('Không đọc được cookies:', e.message);
+}
 
 const app = express();
 app.use(cors({ exposedHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length'] }));
 
+// ---------- Tìm kiếm (youtubei.js) ----------
 let ytPromise;
 function getYT() {
   if (!ytPromise) {
     ytPromise = Innertube.create({ cache: new UniversalCache(false) }).catch((e) => {
-      ytPromise = null; // cho phép thử lại lần sau
+      ytPromise = null;
       throw e;
     });
   }
@@ -20,7 +43,6 @@ getYT().then(() => console.log('✅ InnerTube đã sẵn sàng!')).catch((e) => 
 
 app.get('/health', (_req, res) => res.send('ok'));
 
-// 1. Tìm kiếm
 app.get('/api/search', async (req, res) => {
   try {
     const q = req.query.q;
@@ -36,78 +58,118 @@ app.get('/api/search', async (req, res) => {
         thumbnail: item.thumbnails?.[0]?.url || '',
       }));
     res.json(songs);
+    if (process.env.PREFETCH !== '0') {
+      for (const sg of songs.slice(0, 3)) resolveAudio(sg.id).catch(() => {});
+    }
   } catch (err) {
     console.error('Lỗi tìm kiếm:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// 2. Lấy link audio (thử nhiều client), có cache
-const CLIENTS = ['IOS', 'ANDROID', 'TV', 'WEB_EMBEDDED', 'WEB'];
-const urlCache = new Map(); // id -> { url, mime, exp }
+// ---------- Lấy link audio bằng yt-dlp ----------
+const urlCache = new Map(); // id -> { url, headers, mime, exp }
+const inflight = new Map(); // id -> Promise (gộp các request cùng bài)
+const MIME = { m4a: 'audio/mp4', mp4: 'audio/mp4', webm: 'audio/webm', opus: 'audio/ogg', mp3: 'audio/mpeg' };
 
-async function resolveAudio(id) {
-  const hit = urlCache.get(id);
-  if (hit && hit.exp > Date.now()) return hit;
-
-  const yt = await getYT();
-  const errs = [];
-  for (const client of CLIENTS) {
-    try {
-      const info = await yt.getBasicInfo(id, { client });
-      // ưu tiên m4a (mp4) để chạy được cả Safari/iPhone
-      let format;
-      try {
-        format = info.chooseFormat({ type: 'audio', quality: 'best', format: 'mp4' });
-      } catch {
-        format = info.chooseFormat({ type: 'audio', quality: 'best' });
-      }
-      const url = await format.decipher(yt.session.player);
-      if (!url) throw new Error('Không có URL');
-      const entry = {
-        url,
-        mime: (format.mime_type || 'audio/mp4').split(';')[0],
-        exp: Date.now() + 30 * 60 * 1000,
-      };
-      urlCache.set(id, entry);
-      console.log(`✔ ${id} lấy được bằng client ${client}`);
-      return entry;
-    } catch (e) {
-      errs.push(`${client}: ${e.message}`);
-      console.warn(`✘ ${id} client ${client}: ${e.message}`);
-    }
-  }
-  throw new Error(errs.join(' | ') || 'Không lấy được audio');
+// Giới hạn số yt-dlp chạy cùng lúc
+const MAX_PARALLEL = 3;
+let active = 0;
+const waiting = [];
+function limit(fn) {
+  return new Promise((resolve, reject) => {
+    const run = async () => {
+      active++;
+      try { resolve(await fn()); } catch (e) { reject(e); }
+      finally { active--; const next = waiting.shift(); if (next) next(); }
+    };
+    if (active < MAX_PARALLEL) run(); else waiting.push(run);
+  });
 }
 
-// 3. Proxy stream (hỗ trợ Range để tua bài)
+async function runYtdlp(id, attempt = 0) {
+  const t0 = Date.now();
+  const { stdout } = await execFileP(
+    YTDLP,
+    [
+      '-f', 'bestaudio[ext=m4a]/bestaudio',
+      '-j', '--no-playlist', '--no-warnings',
+      ...(JS_RUNTIME ? ['--js-runtimes', JS_RUNTIME] : []),
+      ...(cookiePath ? ['--cookies', cookiePath] : []),
+      ...(attempt === 0
+        ? (process.env.YT_CLIENT ? ['--extractor-args', `youtube:player_client=${process.env.YT_CLIENT}`] : [])
+        : ['--extractor-args', 'youtube:player_client=tv,android_vr']),
+      `https://www.youtube.com/watch?v=${id}`,
+    ],
+    { maxBuffer: 20 * 1024 * 1024, timeout: 40000 }
+  );
+  const j = JSON.parse(stdout);
+  if (!j.url) throw new Error('yt-dlp không trả về URL');
+  console.log(`✔ ${id} yt-dlp mất ${((Date.now() - t0) / 1000).toFixed(1)}s (${j.ext}, ${j.abr || '?'}kbps)`);
+  // link googlevideo có tham số expire (giây); cache tới gần lúc đó
+  const m = /[?&]expire=(\d+)/.exec(j.url);
+  const exp = m
+    ? Math.max(Number(m[1]) * 1000 - 15 * 60 * 1000, Date.now() + 5 * 60 * 1000)
+    : Date.now() + 20 * 60 * 1000;
+  return {
+    url: j.url,
+    headers: j.http_headers || {},
+    mime: MIME[j.ext] || 'audio/mp4',
+    exp,
+  };
+}
+
+async function resolveWithRetry(id) {
+  try {
+    return await limit(() => runYtdlp(id, 0));
+  } catch (e) {
+    console.warn(`↻ ${id} thử lại (client khác) sau lỗi: ${String(e.message).split('\n')[0]}`);
+    return await limit(() => runYtdlp(id, 1));
+  }
+}
+
+function resolveAudio(id) {
+  const hit = urlCache.get(id);
+  if (hit && hit.exp > Date.now()) return Promise.resolve(hit);
+  if (inflight.has(id)) return inflight.get(id);
+  const p = resolveWithRetry(id)
+    .then((entry) => { urlCache.set(id, entry); return entry; })
+    .finally(() => inflight.delete(id));
+  inflight.set(id, p);
+  return p;
+}
+
+// Tải trước link cho bài sắp phát (frontend gọi khi bài hiện tại đang chạy)
+app.get('/api/prefetch/:id', (req, res) => {
+  const { id } = req.params;
+  if (!/^[\w-]{11}$/.test(id)) return res.sendStatus(400);
+  res.sendStatus(202);
+  resolveAudio(id).catch(() => {});
+});
+
+// ---------- Proxy stream, hỗ trợ Range ----------
 app.get('/api/stream/:id', async (req, res) => {
   const { id } = req.params;
+  if (!/^[\w-]{11}$/.test(id)) return res.status(400).json({ error: 'ID không hợp lệ' });
+
   const ac = new AbortController();
   res.on('close', () => ac.abort());
 
   try {
-    let audio = await resolveAudio(id);
-
-    const fetchUpstream = (a) =>
+    const doFetch = (a) =>
       fetch(a.url, {
-        headers: {
-          Range: req.headers.range || 'bytes=0-',
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-        },
+        headers: { ...a.headers, Range: req.headers.range || 'bytes=0-' },
         signal: ac.signal,
       });
 
-    let upstream = await fetchUpstream(audio);
+    let audio = await resolveAudio(id);
+    let upstream = await doFetch(audio);
 
-    // link hết hạn/bị từ chối -> xoá cache, lấy link mới 1 lần
     if (upstream.status === 403 || upstream.status === 410) {
       urlCache.delete(id);
       audio = await resolveAudio(id);
-      upstream = await fetchUpstream(audio);
+      upstream = await doFetch(audio);
     }
-
     if (!upstream.ok && upstream.status !== 206) {
       throw new Error(`YouTube trả về ${upstream.status}`);
     }
@@ -119,11 +181,10 @@ app.get('/api/stream/:id', async (req, res) => {
       const v = upstream.headers.get(h);
       if (v) res.setHeader(h, v);
     }
-
     Readable.fromWeb(upstream.body).on('error', () => res.end()).pipe(res);
   } catch (err) {
     if (err.name === 'AbortError') return;
-    console.error('Lỗi phát nhạc:', err);
+    console.error('Lỗi phát nhạc:', err.message);
     if (!res.headersSent) res.status(500).json({ error: 'Không thể phát bài này', detail: err.message });
     else res.end();
   }
