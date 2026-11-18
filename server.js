@@ -92,13 +92,14 @@ async function runYtdlp(id, attempt = 0) {
   const { stdout } = await execFileP(
     YTDLP,
     [
-      '-f', 'bestaudio[ext=m4a]/bestaudio',
+      '-f', 'bestaudio[ext=m4a]/bestaudio/best',
       '-j', '--no-playlist', '--no-warnings',
       ...(JS_RUNTIME ? ['--js-runtimes', JS_RUNTIME] : []),
       ...(cookiePath && attempt === 0 ? ['--cookies', cookiePath] : []),
       ...(attempt === 0
         ? (process.env.YT_CLIENT ? ['--extractor-args', `youtube:player_client=${process.env.YT_CLIENT}`] : [])
         : ['--extractor-args', 'youtube:player_client=tv,android_vr']),
+      ...(process.env.YTDLP_EXTRA ? process.env.YTDLP_EXTRA.split(' ').filter(Boolean) : []),
       `https://www.youtube.com/watch?v=${id}`,
     ],
     { maxBuffer: 20 * 1024 * 1024, timeout: 40000 }
@@ -131,6 +132,7 @@ async function resolveWithRetry(id) {
   } catch (e) {
     e1 = e;
     console.warn(`↻ ${id} lần 1 (có cookies) lỗi: ${shortErr(e)}`);
+    if (process.env.DEBUG_YTDLP) console.warn(String(e.stderr || '').slice(-3000));
   }
   try {
     return await limit(() => runYtdlp(id, 1));

@@ -1,4 +1,8 @@
+# Lấy bản Deno (yt-dlp dùng để giải mã JavaScript của YouTube)
+FROM denoland/deno:bin AS deno
+
 FROM node:20-slim
+COPY --from=deno /deno /usr/local/bin/deno
 
 # yt-dlp (bản standalone, không cần Python)
 RUN apt-get update \
@@ -13,7 +17,7 @@ RUN npm install --omit=dev
 COPY server.js ./
 
 ENV YTDLP_PATH=/usr/local/bin/yt-dlp
-ENV JS_RUNTIME=node
+ENV JS_RUNTIME=deno
 
 # Mỗi lần khởi động tự cập nhật yt-dlp rồi chạy server
 CMD ["sh", "-c", "yt-dlp -U || true; node server.js"]
