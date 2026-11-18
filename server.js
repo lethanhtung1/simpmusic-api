@@ -95,7 +95,7 @@ async function runYtdlp(id, attempt = 0) {
       '-f', 'bestaudio[ext=m4a]/bestaudio',
       '-j', '--no-playlist', '--no-warnings',
       ...(JS_RUNTIME ? ['--js-runtimes', JS_RUNTIME] : []),
-      ...(cookiePath ? ['--cookies', cookiePath] : []),
+      ...(cookiePath && attempt === 0 ? ['--cookies', cookiePath] : []),
       ...(attempt === 0
         ? (process.env.YT_CLIENT ? ['--extractor-args', `youtube:player_client=${process.env.YT_CLIENT}`] : [])
         : ['--extractor-args', 'youtube:player_client=tv,android_vr']),
@@ -119,12 +119,24 @@ async function runYtdlp(id, attempt = 0) {
   };
 }
 
+function shortErr(e) {
+  const lines = String(e.stderr || e.message || '').trim().split('\n').filter(Boolean);
+  return (lines[lines.length - 1] || 'lỗi không rõ').slice(0, 300);
+}
+
 async function resolveWithRetry(id) {
+  let e1;
   try {
     return await limit(() => runYtdlp(id, 0));
   } catch (e) {
-    console.warn(`↻ ${id} thử lại (client khác) sau lỗi: ${String(e.message).split('\n')[0]}`);
+    e1 = e;
+    console.warn(`↻ ${id} lần 1 (có cookies) lỗi: ${shortErr(e)}`);
+  }
+  try {
     return await limit(() => runYtdlp(id, 1));
+  } catch (e2) {
+    console.warn(`✘ ${id} lần 2 (không cookies) lỗi: ${shortErr(e2)}`);
+    throw new Error(`Lần 1: ${shortErr(e1)} | Lần 2: ${shortErr(e2)}`);
   }
 }
 
